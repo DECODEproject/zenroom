@@ -116,7 +116,7 @@ zexe() {
 	echo "OUTPUT SIZE: `stat -c '%s' $t/stdout` bytes" >&2
 	if [ $res == 0 ]; then
 		cat $t/stdout
-		echo -e "OK \t|\t `basename $out` \t|\t $exec_time \t|\t $out_size" >> /tmp/zenroom-test-summary.txt
+		echo -e "OK \t;\t `basename $out` \t;\t $exec_time \t;\t $out_size" | sed 's/μs//' >> /tmp/zenroom-test-summary.txt
 	else
 		>&2 cat $t/stderr | grep -v '^ \. '
 		echo "ERR `basename $out`" >> /tmp/zenroom-test-summary.txt
