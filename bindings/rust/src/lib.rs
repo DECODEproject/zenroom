@@ -1,16 +1,57 @@
-#![allow(non_upper_case_globals)]
-#![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
-
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
+use std::fmt;
+use std::sync::{Mutex, MutexGuard, Once};
 
 mod c {
+    #![allow(non_upper_case_globals)]
+    #![allow(non_camel_case_types)]
+    #![allow(non_snake_case)]
+    #![allow(dead_code)]
+    #![allow(deref_nullptr)]
     include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 }
 
+#[derive(Clone, Debug)]
 pub struct ZenResult {
     pub output: String,
     pub logs: String,
+}
+
+#[derive(Clone, Debug)]
+pub enum ZenError {
+    Execution(ZenResult),
+    InvalidInput(std::ffi::NulError),
+}
+
+impl From<std::ffi::NulError> for ZenError {
+    fn from(err: std::ffi::NulError) -> Self {
+        Self::InvalidInput(err)
+    }
+}
+
+impl fmt::Display for ZenError {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Execution(err) => f.write_fmt(format_args!("Execution Error:\n{}", err.logs)),
+            Self::InvalidInput(err) => f.write_fmt(format_args!("Invalid input: {}", err)),
+        }
+    }
+}
+
+impl std::error::Error for ZenError {}
+
+type ZenGIL = MutexGuard<'static, ()>;
+
+fn aquire_zen_gil() -> ZenGIL {
+    static mut MUTEX: *const Mutex<()> = std::ptr::null();
+    static ONCE: Once = Once::new();
+    let mutex: &Mutex<()> = unsafe {
+        ONCE.call_once(|| {
+            MUTEX = std::mem::transmute(Box::new(Mutex::new(())));
+        });
+        MUTEX.as_ref().unwrap()
+    };
+    mutex.lock().unwrap()
 }
 
 const BUF_SIZE: usize = 2 * 1024 * 1024;
@@ -27,62 +68,64 @@ type Fun = unsafe extern "C" fn(
 ) -> ::std::os::raw::c_int;
 
 pub fn zencode_exec(
-    script: CString,
-    conf: CString,
-    keys: CString,
-    data: CString,
-) -> (ZenResult, bool) {
+    script: String,
+    conf: String,
+    keys: String,
+    data: String,
+) -> Result<ZenResult, ZenError> {
     exec_f(c::zencode_exec_tobuf, script, conf, keys, data)
 }
 
 pub fn zenroom_exec(
-    script: CString,
-    conf: CString,
-    keys: CString,
-    data: CString,
-) -> (ZenResult, bool) {
+    script: String,
+    conf: String,
+    keys: String,
+    data: String,
+) -> Result<ZenResult, ZenError> {
     exec_f(c::zenroom_exec_tobuf, script, conf, keys, data)
 }
 
 fn exec_f(
     fun: Fun,
-    script: CString,
-    conf: CString,
-    keys: CString,
-    data: CString,
-) -> (ZenResult, bool) {
+    script: String,
+    conf: String,
+    keys: String,
+    data: String,
+) -> Result<ZenResult, ZenError> {
     let mut stdout = Vec::<i8>::with_capacity(BUF_SIZE);
     let stdout_ptr = stdout.as_mut_ptr();
-    std::mem::forget(stdout);
     let mut stderr = Vec::<i8>::with_capacity(BUF_SIZE);
     let stderr_ptr = stderr.as_mut_ptr();
-    std::mem::forget(stderr);
 
-    let res = unsafe {
+    let lock = aquire_zen_gil();
+    let exit_code = unsafe {
         fun(
-            script.into_raw(),
-            conf.into_raw(),
-            keys.into_raw(),
-            data.into_raw(),
+            CString::new(script)?.into_raw(),
+            CString::new(conf)?.into_raw(),
+            CString::new(keys)?.into_raw(),
+            CString::new(data)?.into_raw(),
             stdout_ptr,
             BUF_SIZE as u64,
             stderr_ptr,
             BUF_SIZE as u64,
         )
     };
+    drop(lock);
 
-    (
-        ZenResult {
-            output: unsafe { CString::from_raw(stdout_ptr) }
-                .into_string()
-                // Do not fail on errors in output
-                .unwrap_or_else(|_| String::from("")),
-            logs: unsafe { CString::from_raw(stderr_ptr) }
-                .into_string()
-                .unwrap(),
-        },
-        res == 0,
-    )
+    let res = ZenResult {
+        output: unsafe { CStr::from_ptr(stdout_ptr) }
+            .to_string_lossy()
+            .into_owned(),
+        logs: unsafe { CStr::from_ptr(stderr_ptr) }
+            .to_string_lossy()
+            .into_owned(),
+    };
+
+    if exit_code == 0 {
+        Ok(res)
+    } else {
+        Err(ZenError::Execution(res))
+    }
 }
 
 #[cfg(test)]
@@ -90,25 +133,21 @@ mod tests {
     use crate::*;
     use serde_json::Value;
 
-    #[test]
-    fn simple_script() {
-        let script = CString::new(
-            r#"
-Scenario 'ecdh': Create the keypair
-Given that I am known as 'Alice'
-When I create the keypair
-Then print my data
-"#,
-        )
-        .unwrap();
-        let (result, success) = zencode_exec(
-            script,
-            CString::new("").unwrap(),
-            CString::new("").unwrap(),
-            CString::new("").unwrap(),
-        );
+    const SAMPLE_SCRIPT: &str = r#"
+    Scenario 'ecdh': Create the keypair
+    Given that I am known as 'Alice'
+    When I create the keypair
+    Then print my data
+    "#;
 
-        assert!(success);
+    #[test]
+    fn simple_script() -> Result<(), ZenError> {
+        let result = zencode_exec(
+            SAMPLE_SCRIPT.into(),
+            String::new(),
+            String::new(),
+            String::new(),
+        )?;
 
         let json: Value = serde_json::from_str(&result.output).unwrap();
         let keypair = json
@@ -120,5 +159,27 @@ Then print my data
             .unwrap();
         assert!(keypair.get("private_key").is_some());
         assert!(keypair.get("public_key").is_some());
+
+        Ok(())
+    }
+
+    #[test]
+    fn threaded_exec() -> Result<(), ZenError> {
+        const NUM_THREADS: usize = 5;
+        let mut threads = Vec::new();
+        for _ in 0..NUM_THREADS {
+            threads.push(std::thread::spawn(|| {
+                zencode_exec(
+                    SAMPLE_SCRIPT.into(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                )
+            }));
+        }
+        for thread in threads {
+            thread.join().expect("thread should not panic")?;
+        }
+        Ok(())
     }
 }
